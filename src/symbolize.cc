@@ -115,6 +115,9 @@ _END_GOOGLE_NAMESPACE_
 #endif
 #if defined(GLOG_OS_OPENBSD)
 #include <sys/exec_elf.h>
+#elif defined(GLOG_OS_QNX)
+#include <sys/elf.h>
+#include <sys/mman.h>
 #else
 #include <elf.h>
 #endif
@@ -153,6 +156,30 @@ static ssize_t ReadFromOffset(const int fd, void *buf, const size_t count,
     ssize_t len;
     NO_INTR(len = pread(fd, buf0 + num_bytes, count - num_bytes,
                         static_cast<off_t>(offset + num_bytes)));
+    if (len < 0) {  // There was an error other than EINTR.
+      return -1;
+    }
+    if (len == 0) {  // Reached EOF.
+      break;
+    }
+    num_bytes += static_cast<size_t>(len);
+  }
+  SAFE_ASSERT(num_bytes <= count);
+  return static_cast<ssize_t>(num_bytes);
+}
+
+// Read up to "count" bytes from the file pointed by file descriptor "fd" 
+// into the buffer starting at "buf" while handling short reads and EINTR.
+//On success, return the number of bytes read.  Otherwise, return
+// -1.
+static ssize_t Read(const int fd, void *buf, const size_t count) {
+  SAFE_ASSERT(fd >= 0);
+  SAFE_ASSERT(count <= static_cast<size_t>(std::numeric_limits<ssize_t>::max()));
+  char *buf0 = reinterpret_cast<char *>(buf);
+  size_t num_bytes = 0;
+  while (num_bytes < count) {
+    ssize_t len;
+    NO_INTR(len = read(fd, buf0 + num_bytes, count - num_bytes));
     if (len < 0) {  // There was an error other than EINTR.
       return -1;
     }
@@ -309,6 +336,10 @@ FindSymbol(uint64_t pc, const int fd, char *out, size_t out_size,
       uint64_t end_address = start_address + symbol.st_size;
       if (symbol.st_value != 0 &&  // Skip null value symbols.
           symbol.st_shndx != 0 &&  // Skip undefined symbols.
+          // Skip TLS symbols. Its st_value is not the virtual address
+          // but instead an offset relative to the beginning of the TLS
+          // template. Thus it cannot be compared to our pc like this.
+          symbol.st_info != STT_TLS &&
           start_address <= pc && pc < end_address) {
         ssize_t len1 = ReadFromOffset(fd, out, out_size,
                                       strtab->sh_offset + symbol.st_name);
@@ -400,7 +431,15 @@ class LineReader {
         offset_(offset),
         bol_(buf),
         eol_(buf),
-        eod_(buf) {}
+        eod_(buf) {
+          #if defined(GLOG_OS_QNX)
+          // We use read (instead of pread) on QNX
+          // so an offset is not possible.
+          if (offset != 0) {
+            abort();
+          }
+          #endif
+        }
 
   // Read '\n'-terminated line from file.  On success, modify "bol"
   // and "eol", then return true.  Otherwise, return false.
@@ -409,7 +448,12 @@ class LineReader {
   // dropped.  It's an intentional behavior to make the code simple.
   bool ReadLine(const char **bol, const char **eol) {
     if (BufferIsEmpty()) {  // First time.
+      #if defined(GLOG_OS_QNX)
+      // Use Read because pread does not work on QNX pmap files.
+      const ssize_t num_bytes = Read(fd_, buf_, buf_len_);
+      #else
       const ssize_t num_bytes = ReadFromOffset(fd_, buf_, buf_len_, offset_);
+      #endif
       if (num_bytes <= 0) {  // EOF or error.
         return false;
       }
@@ -427,7 +471,11 @@ class LineReader {
         char * const append_pos = buf_ + incomplete_line_length;
         const size_t capacity_left = buf_len_ - incomplete_line_length;
         const ssize_t num_bytes =
+        #if defined(GLOG_OS_QNX)
+            Read(fd_, append_pos, capacity_left);
+        #else
             ReadFromOffset(fd_, append_pos, capacity_left, offset_);
+        #endif
         if (num_bytes <= 0) {  // EOF or error.
           return false;
         }
@@ -500,6 +548,204 @@ static char *GetHex(const char *start, const char *end, uint64_t *hex) {
   SAFE_ASSERT(p <= end);
   return const_cast<char *>(p);
 }
+
+#if defined(GLOG_OS_QNX)
+static char * QNXGetHex(const char *start, const char *end, uint64_t *hex) {
+  if (*start != '0' or *(start + 1) != 'x') {
+    // First two chars must be '0x'.
+    return const_cast<char *>(end);
+  }
+  return GetHex(start + 2, end, hex);
+}
+
+// Searches for the object file (from /proc/self/maps) that contains
+// the specified pc.  If found, sets |start_address| to the start address
+// of where this object file is mapped in memory, sets the module base
+// address into |base_address|, copies the object file name into
+// |out_file_name|, and attempts to open the object file.  If the object
+// file is opened successfully, returns the file descriptor.  Otherwise,
+// returns -1.  |out_file_name_size| is the size of the file name buffer
+// (including the null-terminator).
+static ATTRIBUTE_NOINLINE int
+OpenObjectFileContainingPcAndGetStartAddress(uint64_t pc,
+                                             uint64_t &start_address,
+                                             uint64_t &base_address,
+                                             char *out_file_name,
+                                             size_t out_file_name_size) {
+  int object_fd;
+
+  int maps_fd;
+  NO_INTR(maps_fd = open("/proc/self/pmap", O_RDONLY));
+  FileDescriptor wrapped_maps_fd(maps_fd);
+  if (wrapped_maps_fd.get() < 0) {
+    return -1;
+  }
+
+  int mem_fd;
+  NO_INTR(mem_fd = open("/proc/self/as", O_RDONLY));
+  FileDescriptor wrapped_mem_fd(mem_fd);
+  if (wrapped_mem_fd.get() < 0) {
+    return -1;
+  }
+
+  // Iterate over maps and look for the map containing the pc. Then
+  // look into the symbol tables inside.
+  unsigned num_maps = 0;
+
+  char buf[1024];  // Big enough for line of sane /proc/self/pmap.
+  LineReader reader(wrapped_maps_fd.get(), buf, sizeof(buf), 0);
+
+  const char *cursor;
+  const char *eol;
+  // Skip the first line, which is the header.
+  if (!reader.ReadLine(&cursor, &eol)) {  // EOF or malformed line.
+    return -1;
+  }
+  
+  while (true) {
+    num_maps++;
+    if (!reader.ReadLine(&cursor, &eol)) {  // EOF or malformed line.
+      return -1;
+    }
+
+
+    // Start parsing lines in /proc/self/pmap.  Here is an example:
+    //
+    // header: vaddr,size,flags,prot,maxprot,dev,ino,offset,rsv,guardsize,refcnt,mapcnt,path,asinfo
+    // line: 0x0000003b039c5000,
+    // 0x0000000000045000,
+    // 0x00010031,
+    // 0x05,
+    // 0x0d,
+    // 0x00000802,
+    // 0x0000000080000007,
+    // 0x0000000000000000,
+    // 0x0000000000000000,
+    // 0x00000000,
+    // 0x00000127,
+    // 0x00000125,
+    // /proc/boot/toybox,path
+    // {ram}
+    //
+    // We want start address (0x0000003b039c5000), end address (0x0000003b039c5000 + 0x0000000000045000), prot
+    // (0x05) and file path (/proc/boot/toybox).
+    
+    // Read start address.
+    cursor = QNXGetHex(cursor, eol, &start_address);
+    if (cursor == eol || *cursor != ',') {
+      return -1;  // Malformed line.
+    }
+    ++cursor;  // Skip ','.
+
+    // Read end address.
+    uint64_t end_address;
+    cursor = QNXGetHex(cursor, eol, &end_address);
+    if (cursor == eol || *cursor != ',') {
+      return -1;  // Malformed line.
+    }
+    end_address += start_address;
+    ++cursor;  // Skip ','.
+
+    // Read flags.
+    uint64_t tmp;
+    cursor = QNXGetHex(cursor, eol, &tmp);
+    if (cursor == eol || *cursor != ',') {
+      return -1;  // Malformed line.
+    }
+    ++cursor;  // Skip ','.
+
+    // Read prot.
+    uint64_t prot;
+    cursor = QNXGetHex(cursor, eol, &prot);
+    if (cursor == eol || *cursor != ',') {
+      return -1;  // Malformed line.
+    }
+    prot <<= 8; // Left shift by 8 bits since the flags are right shifted by 8 bits
+    ++cursor;  // Skip ','.
+
+    // Determine the base address by reading ELF headers in process memory.
+    ElfW(Ehdr) ehdr;
+    // Skip non-readable maps.
+    if (prot & PROT_READ &&
+        ReadFromOffsetExact(mem_fd, &ehdr, sizeof(ElfW(Ehdr)), start_address) &&
+        memcmp(ehdr.e_ident, ELFMAG, SELFMAG) == 0) {
+      switch (ehdr.e_type) {
+        case ET_EXEC:
+          base_address = 0;
+          break;
+        case ET_DYN:
+          // Find the segment containing file offset 0. This will correspond
+          // to the ELF header that we just read. Normally this will have
+          // virtual address 0, but this is not guaranteed. We must subtract
+          // the virtual address from the address where the ELF header was
+          // mapped to get the base address.
+          //
+          // If we fail to find a segment for file offset 0, use the address
+          // of the ELF header as the base address.
+          base_address = start_address;
+          for (unsigned i = 0; i != ehdr.e_phnum; ++i) {
+            ElfW(Phdr) phdr;
+            if (ReadFromOffsetExact(
+                    mem_fd, &phdr, sizeof(phdr),
+                    start_address + ehdr.e_phoff + i * sizeof(phdr)) &&
+                phdr.p_type == PT_LOAD && phdr.p_offset == 0) {
+              base_address = start_address - phdr.p_vaddr;
+              break;
+            }
+          }
+          break;
+        default:
+          // ET_REL or ET_CORE. These aren't directly executable, so they don't
+          // affect the base address.
+          break;
+      }
+    }
+
+    // Check start and end addresses.
+    if (!(start_address <= pc && pc < end_address)) {
+      continue;  // We skip this map.  PC isn't in this map.
+    }
+
+   // Check flags.  We are only interested in "r*x" maps.
+    if (!(prot & PROT_READ) || !(prot & PROT_EXEC)) {
+      continue;  // We skip this map.
+    }
+    
+
+    // Read until the path.
+    for (int i = 0; i < 8; i++) {
+      cursor = QNXGetHex(cursor, eol, &tmp);
+      if (cursor == eol || *cursor != ',') {
+        return -1;  // Malformed line.
+      }
+      ++cursor;  // Skip ','.
+    }
+
+    // Finally, "cursor" now points to file name of our interest.
+    // But it still has asinfo as a suffix.
+    auto filename = cursor;
+    while (cursor < eol) {
+      ++cursor;
+      if (*cursor == ',') {
+        break;
+      }
+    }
+    char* c = const_cast<char*>(cursor);
+    *c = '\0';
+    // Finally, "cursor" now points to file name of our interest.
+    NO_INTR(object_fd = open(filename, O_RDONLY));
+    if (object_fd < 0) {
+      // Failed to open object file.  Copy the object file name to
+      // |out_file_name|.
+      strncpy(out_file_name, filename, out_file_name_size);
+      // Making sure |out_file_name| is always null-terminated.
+      out_file_name[out_file_name_size - 1] = '\0';
+      return -1;
+    }
+    return object_fd;
+  }
+}
+#else
 
 // Searches for the object file (from /proc/self/maps) that contains
 // the specified pc.  If found, sets |start_address| to the start address
@@ -663,6 +909,7 @@ OpenObjectFileContainingPcAndGetStartAddress(uint64_t pc,
     return object_fd;
   }
 }
+#endif
 
 // POSIX doesn't define any async-signal safe function for converting
 // an integer to ASCII. We'll have to define our own version.

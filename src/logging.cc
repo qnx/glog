@@ -94,10 +94,6 @@ using std::fflush;
 using std::fprintf;
 using std::perror;
 
-#ifdef __QNX__
-using std::fdopen;
-#endif
-
 #ifdef _WIN32
 #define fdopen _fdopen
 #endif
@@ -1046,6 +1042,9 @@ bool LogFileObject::CreateLogfile(const string& time_pid_string) {
   const char* filename = string_filename.c_str();
   //only write to files, create if non-existant.
   int flags = O_WRONLY | O_CREAT;
+  #if defined(GLOG_OS_QNX)
+  flags |= O_APPEND;
+  #endif
   if (FLAGS_timestamp_in_logfile_name) {
     //demand that the file is unique for our timestamp (fail if it exists).
     flags = flags | O_EXCL;
@@ -2386,9 +2385,13 @@ void TruncateLogFile(const char *path, uint64 limit, uint64 keep) {
   // Don't follow symlinks unless they're our own fd symlinks in /proc
   int flags = O_RDWR;
   // TODO(hamaji): Support other environments.
-#ifdef GLOG_OS_LINUX
+#if defined(GLOG_OS_LINUX)
   const char *procfd_prefix = "/proc/self/fd/";
   if (strncmp(procfd_prefix, path, strlen(procfd_prefix))) flags |= O_NOFOLLOW;
+#elif defined(GLOG_OS_QNX)
+  // In QNX symlinks exist, but /proc/self/fd/ does not exist.
+  // So do not follow symlinks under any circumstances.
+  flags |= O_NOFOLLOW;
 #endif
 
   int fd = open(path, flags);

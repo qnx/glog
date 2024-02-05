@@ -31,12 +31,22 @@ int main(int argc, char**argv)
 
     foreach (_namespace ${_NAMESPACES})
       file (WRITE "${_check_file}" "${_check_code}")
-      try_compile (${VARIABLE}
-        "${CMAKE_BINARY_DIR}" "${_check_file}"
-        COMPILE_DEFINITIONS "${CMAKE_REQUIRED_DEFINITIONS}" -DGLOG_GFLAGS_NAMESPACE=${_namespace}
-        LINK_LIBRARIES gflags
-        CMAKE_FLAGS -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
-        OUTPUT_VARIABLE OUTPUT)
+      if(QNX)
+        # Make sure include dirs inherited from packages are not marked with "isystem"
+        try_compile (${VARIABLE}
+          "${CMAKE_BINARY_DIR}" "${_check_file}"
+          COMPILE_DEFINITIONS "${CMAKE_REQUIRED_DEFINITIONS}" -DGLOG_GFLAGS_NAMESPACE=${_namespace}
+          LINK_LIBRARIES gflags
+          CMAKE_FLAGS -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} -DCMAKE_NO_SYSTEM_FROM_IMPORTED=ON
+          OUTPUT_VARIABLE OUTPUT)
+      else()
+        try_compile (${VARIABLE}
+          "${CMAKE_BINARY_DIR}" "${_check_file}"
+          COMPILE_DEFINITIONS "${CMAKE_REQUIRED_DEFINITIONS}" -DGLOG_GFLAGS_NAMESPACE=${_namespace}
+          LINK_LIBRARIES gflags
+          CMAKE_FLAGS -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+          OUTPUT_VARIABLE OUTPUT)
+      endif()
 
       if (${VARIABLE})
         set (${VARIABLE} ${_namespace} CACHE INTERNAL "gflags namespace" FORCE)

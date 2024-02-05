@@ -63,11 +63,13 @@
 #if defined(__ELF__)  // defined by gcc
 #if defined(__OpenBSD__)
 #include <sys/exec_elf.h>
+#elif defined(__QNX__)
+#include <sys/elf.h>
 #else
 #include <elf.h>
 #endif
 
-#if !defined(ANDROID)
+#if !defined(ANDROID) && !defined(__QNX__)
 #include <link.h>  // For ElfW() macro.
 #endif
 

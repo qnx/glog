@@ -50,6 +50,8 @@
 #define GLOG_OS_NETBSD
 #elif defined(__OpenBSD__)
 #define GLOG_OS_OPENBSD
+#elif defined(__QNX__)
+#define GLOG_OS_QNX
 #else
 // TODO(hamaji): Add other platforms.
 #error Platform not supported by glog. Please consider to contribute platform information by submitting a pull request on Github.

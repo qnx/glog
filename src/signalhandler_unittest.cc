@@ -51,6 +51,16 @@ using namespace GFLAGS_NAMESPACE;
 using namespace GOOGLE_NAMESPACE;
 
 static void* DieInThread(void*) {
+  #if defined(GLOG_OS_QNX)
+  // On QNX our compiler will optimize out the division by 0
+  // so we need to raise SIGFPE explicitly.
+  fprintf(
+      stderr, "0x%p is dying\n",
+      gettid());
+  raise(SIGFPE);
+  fprintf(stderr, "We should have died.");
+  return NULL;
+  #else
   // We assume pthread_t is an integral number or a pointer, rather
   // than a complex struct.  In some environments, pthread_self()
   // returns an uint64 but in some other environments pthread_self()
@@ -63,6 +73,7 @@ static void* DieInThread(void*) {
   volatile int b = 1 / a;
   fprintf(stderr, "We should have died: b=%d\n", b);
   return NULL;
+  #endif
 }
 
 static void WriteToStdout(const char* data, size_t size) {
